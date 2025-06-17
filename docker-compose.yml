@@ -1,0 +1,44 @@
+version: '3.8'
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ['6379:6379']
+
+  mongo:
+    image: mongo:6
+    ports: ['27017:27017']
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      # Format: "utilisateur/motdepasse"
+      NEO4J_AUTH: "neo4j/SupDev1234"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+
+  backend:
+    build:
+      context: ./backend
+    volumes:
+      - ./backend:/usr/src/app
+    working_dir: /usr/src/app
+    env_file:
+      - ./backend/.env
+    ports:
+      - '3000:3000'
+    depends_on:
+      - redis
+      - mongo
+      - neo4j
+
+  frontend:
+    build: 
+      context: ./frontend
+    volumes:
+      - ./frontend:/usr/src/app
+    working_dir: /usr/src/app
+    ports:
+      - '5173:5173'
+    depends_on:
+      - backend
