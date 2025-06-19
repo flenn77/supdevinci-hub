@@ -1,1 +1,6 @@
 /node_modules
+script.sh
+# Ignore all log files
+*.log
+resultat.txt
+# Ignore all environment files                      
