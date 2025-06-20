@@ -1,144 +1,205 @@
-# SupDeVinci Travel Hub – README 
+# SupDeVinci Travel Hub – README
 
-> **Poly-glot micro-service (Express + Redis + MongoDB + Neo4j) + front React + monitoring Prometheus**
-> Objectif : **≤ 200 ms** de latence (cache hit) et **≤ 700 ms** (cache miss) pour la route la plus sollicitée.
+*Micro-service (Express + Redis + MongoDB + Neo4j) – front React – monitoring Prometheus*
+**Objectif perf.** : ≤ 200 ms (cache hit) &  ≤ 700 ms (cache miss) sur la route la plus sollicitée.
 
 ---
 
 ## 1. Contenu du dépôt
 
-| Dossier / fichier           | Rôle                                                             |
-| --------------------------- | ---------------------------------------------------------------- |
-| `backend/`                  | API Express + tests de perfs + scripts de seed                   |
-| `frontend/`                 | App React Vite (recherche d’offres & reco)                       |
-| `prometheus/prometheus.yml` | config scrape du backend                                         |
-| `scripts/`                  | Helpers CLI (*demo-up, bench, index, seed…*)                     |
-| `docker-compose.yml`        | Stack complète (Redis, Mongo, Neo4j, backend, front, Prometheus) |
+| Dossier / fichier           | Rôle                                                               |
+| :-------------------------- | :----------------------------------------------------------------- |
+| `backend/`                  | API Express, métriques Prometheus, scripts *seed* & bench          |
+| `frontend/`                 | Application React / Vite (recherche d’offres & reco)               |
+| `prometheus/prometheus.yml` | Configuration de scrape du backend                                 |
+| `scripts/`                  | Helpers CLI (*demo-up, seed-mongo, seed-neo4j, charge, …*)         |
+| `docker-compose.yml`        | Stack complète : Redis, MongoDB, Neo4j, backend, front, Prometheus |
 
 ---
 
-## 2. Démarrage rapide 
+## 2. Lancement rapide
+
+### 2.1 Stack « tout-en-un »
 
 ```bash
-1. build, seed, lancement désenfumé
-./scripts/demo-up.sh      # (~ 1 min la 1ʳᵉ fois)
+# Terminal A : build complet + montée de tous les conteneurs
+./scripts/demo-up.sh          # ~ 1 min la toute première fois
 ```
+
+```
+Environnement prêt :
+  Frontend    http://localhost:5173
+  API         http://localhost:3000
+  Prometheus  http://localhost:9090
+  Neo4j       http://localhost:7474   (neo4j / SupDev1234)
+```
+
+> `demo-up.sh` **ne charge pas** les jeux de données pour que l’on puisse les rejouer à volonté.
+
+### 2.2 Injection des données (2 terminaux supplémentaires)
+
 ```bash
-2. URLs utiles
- - Frontend         : http://localhost:5173
- - API backend      : http://localhost:3000
- - Prometheus UI    : http://localhost:9090
- - Neo4j Browser    : http://localhost:7474 (neo4j / SupDev1234)
+# Terminal B : seed MongoDB (catalogue d’offres)
+./scripts/seed-mongo.sh          # garder la fenêtre ouverte pour voir les logs
 ```
 
-`demo-up.sh` fait :
+```bash
+# Terminal C : seed Neo4j (villes + relations NEAR)
+./scripts/seed-neo4j.sh          # idem, on laisse tourner
+```
 
-1. `docker compose down -v && up -d --build …`
-2. Attente du backend (health-check sur `/login`)
-3. Seed **Mongo** (`seed_mongo_full.js`) + **Neo4j** (`seed_neo4j.js`)
-4. Affiche les URLs finaux.
-
-> La stack vit dans le réseau compose, donc front & Prometheus pointent directement sur **backend:3000**.
+Quand les deux scripts affichent `✔ seed exécuté`, la plateforme est prête ; le front peut appeler `/offers` et `/reco`, les benchs & tests temps-réel fonctionnent.
 
 ---
 
-## 3. Architecture
+## 3. Architecture technique
 
 ```
-┌──────────┐     Pub/Sub      ┌──────────┐
-│  Redis   │◄─────────────┐   │ Frontend │  React+Vite
-│  cache   │               │   └──────────┘
-└──────────┘               │        ▲   fetch /offers /reco /login
-       ▲    gzip JSON      │        │
-       │   TTL 60 / 300 s  │        │
-       │                   │        │
-┌──────┴──────┐   Mongoose  │        │
-│   Backend   │─────────────┘        │
-│  Express    │  MongoDB          Prometheus
-│  0.0.0.0:3000   Neo4j            scrape /metrics
+┌───────────┐  Pub/Sub   ┌───────────┐
+│   Redis   │◄────────┐ │  Frontend │  React + Vite
+│ cache +   │          │ └───────────┘
+│ sessions  │          │      ▲  fetch /offers /reco /login
+└───────────┘          │      │
+       ▲  gzip JSON 60/300 s  │
+       │                     │
+┌──────┴──────┐   MongoDB     │
+│   Backend   │───────────────┘
+│  Express    │   Neo4j           Prometheus
+│  0.0.0.0:3000                  scrape /metrics
 └─────────────┘
 ```
 
-* **Redis** – clés
+* **Redis**
 
-  * `offers:<from>:<to>` 60 s
-  * `offers:<id>` 300 s
-  * `session:<uuid>` 900 s
-  * canal Pub/Sub `offers:new`
-* **MongoDB** – collection `offers`
-  index `{from:1, to:1, price:1}` + texte sur `provider`.
-* **Neo4j** – nœuds `(:City)` + relation `[:NEAR {weight}]`
-  Contrainte unique `City.code`.
+  * `offers:<from>:<to>` – TTL 60 s
+  * `offers:<id>` – TTL 300 s
+  * `session:<uuid>` – TTL 900 s
+  * canal Pub/Sub : `offers:new`
+* **MongoDB**
+
+  * collection `offers` (documents JSON)
+  * indexes : `{from:1, to:1, price:1}` + index texte sur `provider`
+* **Neo4j**
+
+  * nœuds `(:City {code, name, country})`
+  * relations `[:NEAR {weight}]`
+  * contrainte d’unicité `City.code`
 
 ---
 
 ## 4. API HTTP
 
-| Méthode & route                        | Fonction           | Détail / flux interne                                              |
-| -------------------------------------- | ------------------ | ------------------------------------------------------------------ |
-| `GET /offers?from=PAR&to=TYO&limit=10` | Recherche d’offres | Cache Redis TTL 60 → Mongo trié `price` si miss (+ gzip)           |
-| `GET /offers/:id`                      | Détail 1 offre     | Cache Redis TTL 300 → Mongo → reco 3 IDs (Neo4j + Mongo)           |
-| `POST /offers`                         | Création offre     | Insert Mongo, `DEL offers:<from>:<to>`, `PUBLISH offers:new {...}` |
-| `GET /reco?city=PAR&k=3`               | Villes proches     | Cypher `MATCH (c)-[:NEAR]->(n)` ordre `weight`                     |
-| `POST /login` JSON `{userId}`          | Authn légère       | UUID v4 → `session:<uuid>` TTL 900                                 |
-| `GET /metrics`                         | Prometheus         | Histogramme HTTP + compteurs cacheHit/cacheMiss                    |
+| Méthode & route                         | Fonction métier        | Flux interne                                                                  |
+| :-------------------------------------- | :--------------------- | :---------------------------------------------------------------------------- |
+| `GET  /offers?from=PAR&to=TYO&limit=10` | Recherche d’offres     | Cache Redis 60 s → Mongo trié `price` si miss (résultat gzip)                 |
+| `GET  /offers/:id`                      | Détails d’une offre    | Cache Redis 300 s → Mongo → 3 ID liés (Neo4j pour les villes proches + Mongo) |
+| `POST /offers`                          | Création d’offre       | Insert Mongo → `DEL offers:<from>:<to>` → `PUBLISH offers:new …`              |
+| `GET  /reco?city=PAR&k=3`               | Recommandations villes | Cypher `MATCH (c)-[:NEAR]->(n)` tri `weight`                                  |
+| `POST /login` `{userId}`                | Authn légère           | Génère UUID v4 → `session:<uuid>` TTL 900 s                                   |
+| `GET  /metrics`                         | Metrics Prometheus     | Histogramme HTTP + compteurs cacheHit / cacheMiss                             |
 
-Toutes les réponses sont `application/json; charset=utf-8`.
-
----
-
-## 5. Scripts CLI utiles (dossier `scripts/`)
-
-| Script                            | Ce qu’il fait                                                                                               |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `demo-up.sh`                      | (re)build complet + seed & lancement                                                                        |
-| `seed-mongo.sh` / `seed-neo4j.sh` | Seed isolé de chaque base + vérification                                                                    |
-| `index-mongodb.sh`                | Affiche les index & plan d’exécution optimisé                                                               |
-| `constraint-neo4j.sh`             | Montre la contrainte `city_code` + test doublon                                                             |
-| `redis-listen.sh`                 | `redis-cli SUBSCRIBE offers:new` en direct                                                                  |
-| `bench-hey.sh`                    | Flush cache, mesure **MISS / HIT** (`time`), puis charge 15 s – 20 connexions avec `autocannon` (via `npx`) |
+Toutes les réponses : `application/json; charset=utf-8`.
 
 ---
 
-## 6. Performance cible 
+## 5. Scripts CLI utiles
 
-Exemple de résultat (`bench-hey.sh`) :
+| Script (dossier `scripts/`) | Ce qu’il fait                                                                          |
+| :-------------------------- | :------------------------------------------------------------------------------------- |
+| `demo-up.sh`                | Build + montée de la stack (sans seed)                                                 |
+| `seed-mongo.sh`             | Jeu d’offres complet → MongoDB                                                         |
+| `seed-neo4j.sh`             | Villes & relations → Neo4j                                                             |
+| `index-mongodb.sh`          | Affiche les index et le *query-plan* optimisé                                          |
+| `constraint-neo4j.sh`       | Montre la contrainte `city_code` puis teste un doublon                                 |
+| `redis-listen.sh`           | `redis-cli SUBSCRIBE offers:new` (écoute temps réel)                                   |
+| `charge.sh`                 | Flush cache → mesure **MISS/HIT** (`time`) → charge 15 s, 20 connexions (`autocannon`) |
+
+---
+
+## 6. Tests rapides
+
+### 6.1 Authentification & session Redis
+
+```bash
+# créer une session
+curl -s -X POST http://localhost:3000/login \
+     -H "Content-Type: application/json" \
+     -d '{"userId":"u42"}' | jq .
+#▶ { "token":"<UUID>", "expires_in":900 }
+
+# vérifier côté Redis
+docker compose exec -T redis redis-cli
+> GET  session:<UUID>
+"u42"
+> TTL  session:<UUID>
+(…)
+```
+
+### 6.2 Notification temps-réel
+
+```bash
+# Terminal D : abonné au canal
+./scripts/redis-listen.sh
+```
+
+```bash
+# Terminal E : insertion live
+curl -X POST http://localhost:3000/offers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider":"LiveDemo",
+    "from":"PAR","to":"TYO",
+    "price":450,"currency":"EUR",
+    "departDate":"2025-07-10","returnDate":"2025-07-20"
+  }'
+```
+
+> Le message JSON apparaît aussitôt dans le terminal D.
+
+---
+
+## 7. Performance cible
+
+Extrait de `./scripts/charge.sh` :
 
 ```
 MISS : 18 ms      HIT : 13 ms
-autocannon (15s, 20 conn.) :
-  p95 latency = 22-25 ms
+autocannon (15 s, 20 conn.) :
+  p95 latency ≈ 22-25 ms
   ~1 370 req/s
 ```
 
-→ largement sous les 200 ms (hit) et 700 ms (miss) demandés.
+→ sous les 200 ms (hit) et 700 ms (miss) exigés.
 
 ---
 
-## 7. Monitoring Prometheus
+## 8. Monitoring Prometheus
 
-* **Metrics exposées** :
-  `supdevinci_http_duration_seconds` *(Histogram)*
-  `supdevinci_cache_hit_total`, `supdevinci_cache_miss_total` *(Counters)*
+* **Metrics exposées**
+  `supdevinci_http_duration_seconds` (Histogram)
+  `supdevinci_cache_hit_total`, `supdevinci_cache_miss_total` (Counters)
 
-  * `prom-client` default (CPU, GC, etc.).
-* **Prometheus UI** : [http://localhost:9090](http://localhost:9090)
-  Exemple de requête :
+  * metrics système par `prom-client`
 
-  ```
-  rate(supdevinci_cache_hit_total[1m])
-  histogram_quantile(0.95, rate(supdevinci_http_duration_seconds_bucket[1m]))
-  ```
+* **UI** :[http://localhost:9090](http://localhost:9090)
 
----
+Requêtes utiles :
 
-## 8. Build manuel (alternative)
-
-```bash
-docker compose up -d           # stack sans seed
-./scripts/seed-mongo.sh        # BSON d’exemple
-./scripts/seed-neo4j.sh
-./scripts/bench-hey.sh
+```promql
+rate(supdevinci_cache_hit_total[1m])
+histogram_quantile(0.95, rate(supdevinci_http_duration_seconds_bucket[1m]))
 ```
 
+---
+
+## 9. Lancement « à la carte » (optionnel)
+
+```bash
+docker compose up -d           # stack brute, sans jeu de données
+./scripts/seed-mongo.sh
+./scripts/seed-neo4j.sh
+./scripts/index-mongodb.sh      # vérifier l’index
+./scripts/constraint-neo4j.sh   # vérifier la contrainte
+./scripts/charge.sh             # bench
+```
 
