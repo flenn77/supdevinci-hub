@@ -1,11 +1,12 @@
 // backend/src/routes/offers.js
 import { Router } from 'express';
 import { db, redis, neo4jDriver } from '../db.js';
+import { cacheHit, cacheMiss }   from '../metrics.js';
 import { gzip as gzipCb, gunzip as gunzipCb } from 'zlib';
 import { promisify } from 'util';
 import { ObjectId } from 'mongodb';
 
-const gzip   = promisify(gzipCb);
+const gzip = promisify(gzipCb);
 const gunzip = promisify(gunzipCb);
 
 const router = Router();
@@ -21,8 +22,10 @@ router.get('/', async (req, res) => {
     const buf = await redis.getBuffer(cacheKey);
     if (buf) {
       console.log('→ cache hit');
+      cacheHit.inc();
       return res.json(JSON.parse((await gunzip(buf)).toString()));
     }
+    cacheMiss.inc();
     const offers = await db
       .collection('offers')
       .find({ from, to })
@@ -92,5 +95,45 @@ router.get('/:id', async (req, res) => {
     return res.status(500).json({ error: 'Erreur interne du serveur.' });
   }
 });
+
+
+router.post('/', async (req, res) => {
+  const {
+    provider, from, to, price, currency,
+    departDate, returnDate,
+    legs = [], hotel = null, activity = null
+  } = req.body;
+
+  // — Validation minimale —
+  if (!provider || !from || !to || !price || !currency) {
+    return res.status(400).json({
+      error: 'Champs obligatoires : provider, from, to, price, currency'
+    });
+  }
+
+  try {
+    // insertion MongoDB
+    const { insertedId } = await db.collection('offers').insertOne({
+      provider, from, to, price, currency,
+      departDate, returnDate,
+      legs, hotel, activity
+    });
+
+    // Invalidation du cache liste « offers:<from>:<to> »
+    await redis.del(`offers:${from}:${to}`);
+
+    // Publication Pub/Sub
+    await redis.publish(
+      'offers:new',
+      JSON.stringify({ offerId: insertedId.toString(), from, to })
+    );
+
+    return res.status(201).json({ id: insertedId });
+  } catch (err) {
+    console.error('Erreur POST /offers :', err);
+    return res.status(500).json({ error: 'Erreur interne du serveur.' });
+  }
+});
+
 
 export default router;
